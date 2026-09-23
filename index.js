@@ -20,11 +20,13 @@ const FOLLOWUP_MAX = Number(process.env.FOLLOWUP_MAX || 2);    // nudges per sil
 const PAUSE_MIN = Number(process.env.PAUSE_MIN || 30);         // bot stays quiet after you type in a chat
 const ACTIVE_HOURS = [10, 19];                                 // IST window for follow-ups/reminders
 
+// 90s: a /reply can legitimately take a while (model + its retry + the AI queue).
 async function api(method, path, body) {
   const r = await fetch(`${BACKEND_URL.replace(/\/+$/, "")}/internal/wa${path}`, {
     method,
     headers: { "content-type": "application/json", "x-internal-key": WA_INTERNAL_KEY },
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(90000),
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
@@ -222,8 +224,9 @@ async function flush(jid) {
     }
     await escalate(text, r.reply || t(lang).checking);
   } catch (e) {
+    // Never show the client an error. Hand it to the owner quietly and say we're checking.
     console.error("flush", e);
-    await send(jid, { text: t(lang).error }).catch(() => {});
+    await escalate(text || "[failed to process]", t(lang).checking).catch(() => {});
   }
 }
 
@@ -257,10 +260,8 @@ async function start() {
   // "append" too: messages that arrived while the bot was offline. handle() drops anything >12h old.
   sock.ev.on("messages.upsert", ({ messages, type }) => {
     if (type !== "notify" && type !== "append") return;
-    for (const m of messages) handle(m).catch((e) => {
-      console.error("handle", e);
-      if (!m.key.fromMe) send(m.key.remoteJid, { text: t().error }).catch(() => {});
-    });
+    // Log and stay silent: flush() owns the reply path and its own fallback.
+    for (const m of messages) handle(m).catch((e) => console.error("handle", e));
   });
   // They're still typing (or recording) — keep waiting instead of answering half a thought.
   sock.ev.on("presence.update", ({ id, presences }) => {
