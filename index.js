@@ -146,36 +146,72 @@ async function handle(m) {
   if ((pausedUntil.get(jid) || 0) > Date.now()) return;
 
   const name = m.pushName || "";
-  const s = session(phone || jid);
-  const lang = () => chat.lang || "hinglish";
+  const lang = chat.lang || "hinglish";
 
   if (OPT_OUT.test(text)) {
     await api("POST", "/chats/set", { jid: chat.jid, opted_out: true });
-    return say(jid, t(lang()).optedOut);
+    return say(jid, t(lang).optedOut);
   }
 
-  async function escalate(question, holding, withMedia = false) {
+  // Don't answer the first line of someone who is still typing the rest of their
+  // thought: collect what they send, then reply once to all of it.
+  queue({ jid, phone, name, lang, text, kind, msg: m });
+  sock.presenceSubscribe(jid).catch(() => {});   // so "composing" reaches us and extends the wait
+}
+
+// ---- wait for them to finish -------------------------------------------------
+const WAIT_MS = Number(process.env.REPLY_WAIT_MS || 8000);        // quiet time before replying
+const MAX_WAIT_MS = Number(process.env.REPLY_MAX_WAIT_MS || 60000); // ...but never hold longer than this
+const pending = new Map();   // jid -> { first, timer, parts[], ctx }
+
+function queue(ctx) {
+  let p = pending.get(ctx.jid);
+  if (!p) { p = { first: Date.now(), parts: [], ctx }; pending.set(ctx.jid, p); }
+  p.ctx = { ...ctx, msg: ctx.kind ? ctx.msg : p.ctx.msg, kind: ctx.kind || p.ctx.kind };
+  if (ctx.text) p.parts.push(ctx.text);
+  hold(ctx.jid);
+}
+
+// (re)start the quiet timer — called again on every new message and while they type
+function hold(jid) {
+  const p = pending.get(jid);
+  if (!p) return;
+  clearTimeout(p.timer);
+  const left = p.first + MAX_WAIT_MS - Date.now();
+  p.timer = setTimeout(() => flush(jid), Math.max(1000, Math.min(WAIT_MS, left)));
+}
+
+async function flush(jid) {
+  const p = pending.get(jid);
+  if (!p) return;
+  pending.delete(jid);
+  const { phone, name, lang, kind, msg } = p.ctx;
+  const text = p.parts.join("\n").trim();          // everything they said, as one message
+  const s = session(phone || jid);
+
+  const escalate = async (question, holding, withMedia = false) => {
     const now = Date.now();
     s.escalations = s.escalations.filter((x) => now - x < 30 * 60e3);
     if (s.escalations.length >= 4) return;            // already waiting on the owner; stay quiet
     s.escalations.push(now);
-    const { id } = await api("POST", "/questions", { phone, jid, name, text: question, lang: lang() });
+    const { id } = await api("POST", "/questions", { phone, jid, name, text: question, lang });
     const contact = await api("GET", `/contact/${phone || "0"}`).catch(() => null);
-    const sent = await send(OWNER_JID, { text: ownerSummary({ id, name, phone, text: question, lang: lang(), contact, kind: withMedia ? kind : null }) });
-    if (withMedia) await send(OWNER_JID, { forward: m }).catch(() => {});
+    const sent = await send(OWNER_JID, { text: ownerSummary({ id, name, phone, text: question, lang, contact, kind: withMedia ? kind : null }) });
+    if (withMedia && msg) await send(OWNER_JID, { forward: msg }).catch(() => {});
     await api("PATCH", `/questions/${id}`, { owner_msg_id: sent.key.id });
     if (holding) { await say(jid, holding); await api("POST", "/sent", { jid, text: holding }).catch(() => {}); }
-  }
+  };
 
-  if (kind) {
-    await escalate(text || `[${kind}]`, t(lang()).media, true);
-    return;
+  try {
+    if (kind) return await escalate(text || `[${kind}]`, t(lang).media, true);
+    if (!text) return;
+    const r = await api("POST", "/reply", { text, phone, jid, name });
+    if (r.reply && !r.escalate) return await say(jid, r.reply);
+    await escalate(text, r.reply || t(lang).checking);
+  } catch (e) {
+    console.error("flush", e);
+    await send(jid, { text: t(lang).error }).catch(() => {});
   }
-
-  // The conversation itself.
-  const r = await api("POST", "/reply", { text, phone, jid, name });
-  if (r.reply && !r.escalate) return say(jid, r.reply);
-  return escalate(text, r.reply || t(lang()).checking);
 }
 
 async function start() {
@@ -212,6 +248,11 @@ async function start() {
       console.error("handle", e);
       if (!m.key.fromMe) send(m.key.remoteJid, { text: t().error }).catch(() => {});
     });
+  });
+  // They're still typing (or recording) — keep waiting instead of answering half a thought.
+  sock.ev.on("presence.update", ({ id, presences }) => {
+    if (!pending.has(id)) return;
+    if (Object.values(presences || {}).some((p) => p?.lastKnownPresence === "composing" || p?.lastKnownPresence === "recording")) hold(id);
   });
   if (freshLink) sock.ev.on("messaging-history.set", ({ chats, messages }) => markLegacy(chats, messages).catch((e) => console.error("legacy", e.message)));
 }
