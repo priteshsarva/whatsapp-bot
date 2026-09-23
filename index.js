@@ -85,6 +85,11 @@ async function handleOwner(jid, text, quoted) {
     const r = await api("POST", "/chats/set", { phone: onOff[2], status }).catch((e) => ({ error: e.message }));
     return send(jid, { text: r.error ? `⚠️ ${r.error}` : r.updated ? `✅ Bot ${onOff[1].toLowerCase()} for ${onOff[2].trim()}` : `No chat found for ${onOff[2].trim()}` });
   }
+  const reset = text.match(/^reset\s+([\d\s+]{10,})$/i);
+  if (reset) {
+    const r = await api("POST", "/forget", { phone: reset[1] }).catch((e) => ({ error: e.message }));
+    return send(jid, { text: r.error ? `⚠️ ${r.error}` : `🧹 Chat memory cleared for ${reset[1].trim()} — next message starts fresh` });
+  }
   const tag = text.match(/^#(\d+)\s*([\s\S]*)$/);
   let body;
   if (tag) body = { id: +tag[1], ...parseReply(tag[2].trim()) };
