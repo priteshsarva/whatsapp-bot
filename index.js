@@ -329,6 +329,14 @@ async function tick() {
         questions.map((q) => `#${q.id} · ${q.name || "+" + q.phone}: "${q.text.slice(0, 80)}"`).join("\n") +
         `\n\nReply  #id <answer>  or  #id skip` });
     }
+
+    // Same daily slot: who the assistant talked to and how promising they look.
+    const { leads } = await api("GET", "/leads/new?hours=24").catch(() => ({ leads: [] }));
+    const hot = leads.filter((l) => l.score !== "cold");
+    if (hot.length) {
+      await send(OWNER_JID, { text: `🔥 ${hot.length} lead(s) from yesterday:\n\n` +
+        hot.map((l) => `${l.score === "hot" ? "🔥" : "🙂"} ${l.name || "+" + l.phone} · ${[l.business, l.city, l.sells, l.shops && l.shops + " shop"].filter(Boolean).join(" · ") || "—"}\n   +${l.phone} — ${l.score_reason || ""}`).join("\n") });
+    }
   }
 
   const { chats } = await api("GET", `/chats/due?days=${FOLLOWUP_DAYS}&max=${FOLLOWUP_MAX}`);
