@@ -206,7 +206,15 @@ async function flush(jid) {
     if (kind) return await escalate(text || `[${kind}]`, t(lang).media, true);
     if (!text) return;
     const r = await api("POST", "/reply", { text, phone, jid, name });
-    if (r.reply && !r.escalate) return await say(jid, r.reply);
+    if (r.reply && !r.escalate) {
+      await say(jid, r.reply);
+      // Product photos from our catalogue — captions carry details, never prices.
+      for (const p of r.products || []) {
+        await send(jid, { image: { url: p.image }, caption: p.caption }).catch((e) => console.error("img", e.message));
+        await sleep(700);
+      }
+      return;
+    }
     await escalate(text, r.reply || t(lang).checking);
   } catch (e) {
     console.error("flush", e);
