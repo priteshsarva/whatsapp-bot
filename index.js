@@ -73,11 +73,17 @@ async function phoneOf(key) {
   return mapped ? pn(mapped) : "";
 }
 
-// Owner reply body: "skip" | "=5" | "fix <better wording>" | answer text
+// Owner reply body:
+//   "ok" / "haan" / "send"        -> send the draft as it is
+//   "as is <text>"                -> send exactly these words, no drafting
+//   "skip" | "=5" | "fix <text>"  -> as before
+//   anything else                 -> your note (answer OR instruction) -> drafted for your OK
 const parseReply = (s) =>
-  /^skip$/i.test(s) ? { skip: true }
+  /^(ok|okay|ok ji|haan|haan ji|yes|y|send|bhej do|theek hai|sahi hai|👍)$/i.test(s.trim()) ? { confirm: true }
+  : /^skip$/i.test(s) ? { skip: true }
   : /^=\s*\d+$/.test(s) ? { faq_id: +s.match(/\d+/)[0] }
   : /^fix\s+/i.test(s) ? { text: s.replace(/^fix\s+/i, ""), fix: true }
+  : /^as is\s+/i.test(s) ? { text: s.replace(/^as is\s+/i, ""), raw: true }
   : { text: s };
 
 async function handleOwner(jid, text, quoted) {
@@ -96,11 +102,22 @@ async function handleOwner(jid, text, quoted) {
   let body;
   if (tag) body = { id: +tag[1], ...parseReply(tag[2].trim()) };
   else if (quoted && text) body = { owner_msg_id: quoted, ...parseReply(text) };
+  else if (text && parseReply(text).confirm) body = { confirm: true };  // plain "ok" -> the latest draft
   else return send(jid, { text: OWNER_HELP });
   try {
     const r = await api("POST", "/answer", body);
     const q = r.question;
-    // Sent word for word as the owner typed it — never rephrased.
+
+    // Draft: show it to the owner and wait for their go-ahead.
+    if (r.drafted) {
+      const preview = await send(jid, {
+        text: `📝 Draft for #${q.id} → ${q.name || "+" + q.phone}\n\n${r.draft}\n\n` +
+              `Reply *ok* to send · type a correction to redo it · *#${q.id} as is <text>* to send your exact words`,
+      });
+      if (preview?.key?.id) await api("PATCH", `/questions/${q.id}`, { draft_msg_id: preview.key.id }).catch(() => {});
+      return;
+    }
+
     if (r.answer && !r.fixed) {
       await say(q.jid, r.answer);
       await api("POST", "/sent", { jid: q.jid, text: r.answer }).catch(() => {});
