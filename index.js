@@ -1,12 +1,12 @@
-// WhatsApp support bot (no AI). Linked-device connection via Baileys; all data
-// and FAQ matching come from the backend's /internal/wa routes.
-//   Store owner -> menu / own account data / FAQ match -> else escalate to OWNER_PHONE.
-//   Owner quote-replies (or "#12 answer") -> answer goes back + becomes a FAQ.
+// WhatsApp assistant (Baileys linked device). No menus, no greeting script, no
+// language question: every client message goes to the backend's /internal/wa/reply,
+// which holds the conversation. Anything it can't handle is sent to OWNER_PHONE,
+// and the owner's answer goes back to the client and is saved for next time.
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, normalizeMessageContent, generateMessageIDV2 } from "baileys";
 import pino from "pino";
 import QRCode from "qrcode";
 import fs from "fs";
-import { t, LANG_PROMPT, ownerSummary, OWNER_HELP } from "./texts.js";
+import { t, ownerSummary, OWNER_HELP } from "./texts.js";
 
 const { BACKEND_URL, WA_INTERNAL_KEY, OWNER_PHONE, AUTH_DIR = "./auth", GO_LIVE } = process.env;
 if (!BACKEND_URL || !WA_INTERNAL_KEY || !OWNER_PHONE || !GO_LIVE) throw new Error("Set BACKEND_URL, WA_INTERNAL_KEY, OWNER_PHONE, GO_LIVE in .env");
@@ -19,8 +19,6 @@ const FOLLOWUP_DAYS = Number(process.env.FOLLOWUP_DAYS || 2);  // quiet days bef
 const FOLLOWUP_MAX = Number(process.env.FOLLOWUP_MAX || 2);    // nudges per silence, then stop
 const PAUSE_MIN = Number(process.env.PAUSE_MIN || 30);         // bot stays quiet after you type in a chat
 const ACTIVE_HOURS = [10, 19];                                 // IST window for follow-ups/reminders
-const GREETINGS = new Set(["menu", "hi", "hii", "hello", "hey", "namaste", "नमस्ते", "start", "help"]);
-const HINDI = /[ऀ-ॿ]/;
 
 async function api(method, path, body) {
   const r = await fetch(`${BACKEND_URL.replace(/\/+$/, "")}/internal/wa${path}`, {
@@ -34,11 +32,9 @@ async function api(method, path, body) {
 }
 const pushStatus = (state, qr = null) => api("POST", "/bot-status", { state, qr }).catch(() => {});
 
-// ponytail: menu position lives in memory — a restart just drops people back to the main menu.
+// Per-chat scratch state: escalation rate limit, and pause while you type yourself.
 const sessions = new Map();
-const session = (k) => { if (!sessions.has(k)) sessions.set(k, { menu: "main", escalations: [] }); return sessions.get(k); };
-
-// Chats where you typed yourself mid-conversation: jid -> pause-until ms.
+const session = (k) => { if (!sessions.has(k)) sessions.set(k, { escalations: [] }); return sessions.get(k); };
 const pausedUntil = new Map();
 
 let sock;
@@ -54,10 +50,10 @@ async function send(jid, content) {
   return sock.sendMessage(jid, content, { messageId });
 }
 
-// "typing…" + a short human-ish pause: replies that land instantly get numbers flagged.
+// "typing…" and a pause that grows with the message: instant replies read as a bot.
 async function say(jid, text) {
   await sock.sendPresenceUpdate("composing", jid).catch(() => {});
-  await sleep(800 + Math.random() * 1500);
+  await sleep(Math.min(6000, 1200 + text.length * 35) + Math.random() * 1200);
   const sent = await send(jid, { text });
   if (jid !== OWNER_JID) api("POST", "/chats/event", { jid, dir: "out" }).catch(() => {});
   return sent;
@@ -75,8 +71,12 @@ async function phoneOf(key) {
   return mapped ? pn(mapped) : "";
 }
 
-// Owner reply body: "skip" | "=5" | answer text
-const parseReply = (s) => /^skip$/i.test(s) ? { skip: true } : /^=\s*\d+$/.test(s) ? { faq_id: +s.match(/\d+/)[0] } : { text: s };
+// Owner reply body: "skip" | "=5" | "fix <better wording>" | answer text
+const parseReply = (s) =>
+  /^skip$/i.test(s) ? { skip: true }
+  : /^=\s*\d+$/.test(s) ? { faq_id: +s.match(/\d+/)[0] }
+  : /^fix\s+/i.test(s) ? { text: s.replace(/^fix\s+/i, ""), fix: true }
+  : { text: s };
 
 async function handleOwner(jid, text, quoted) {
   const onOff = text.match(/^(on|off)\s+([\d\s+]{10,})$/i);
@@ -93,8 +93,14 @@ async function handleOwner(jid, text, quoted) {
   try {
     const r = await api("POST", "/answer", body);
     const q = r.question;
-    if (r.answer) await say(q.jid, t(q.lang).ownerReply(r.answer));
-    await send(jid, { text: r.answer ? `✅ #${q.id} sent to ${q.name || "+" + q.phone} · saved as FAQ ${r.faq_id}` : `⏭ #${q.id} skipped` });
+    // Sent word for word as the owner typed it — never rephrased.
+    if (r.answer && !r.fixed) {
+      await say(q.jid, r.answer);
+      await api("POST", "/sent", { jid: q.jid, text: r.answer }).catch(() => {});
+    }
+    await send(jid, { text: r.fixed ? `✏️ #${q.id} saved (answer ${r.faq_id}) — not re-sent to the client`
+      : r.answer ? `✅ #${q.id} sent to ${q.name || "+" + q.phone}`
+      : `⏭ #${q.id} skipped` });
   } catch (e) {
     await send(jid, { text: `⚠️ ${e.message}` });
   }
@@ -103,8 +109,9 @@ async function handleOwner(jid, text, quoted) {
 // You typed in a chat from the bot phone. Before the client has ever replied, that's
 // your starter message: the chat becomes the bot's to carry on. Once the client is
 // talking, it means you've stepped in, so the bot keeps quiet for PAUSE_MIN.
-async function handleManualOut(jid) {
+async function handleManualOut(jid, text) {
   const r = await api("POST", "/chats/event", { jid, dir: "out" });
+  if (text) api("POST", "/sent", { jid, text }).catch(() => {});   // your words are part of the conversation
   if (r.chat.status === "active" && r.chat.last_in_at) pausedUntil.set(jid, Date.now() + PAUSE_MIN * 60e3);
 }
 
@@ -120,14 +127,14 @@ async function handle(m) {
   if (!c || c.reactionMessage || c.protocolMessage) return;
 
   const phone = await phoneOf(m.key);
-  if (m.key.fromMe) {
-    if (botSent.has(m.key.id) || jid === OWNER_JID || phone === OWNER) return;
-    return handleManualOut(jid);
-  }
-  if (c.stickerMessage) return;
-
   const text = (c.conversation || c.extendedTextMessage?.text || c.imageMessage?.caption ||
     c.videoMessage?.caption || c.documentMessage?.caption || "").trim();
+
+  if (m.key.fromMe) {
+    if (botSent.has(m.key.id) || jid === OWNER_JID || phone === OWNER) return;
+    return handleManualOut(jid, text);
+  }
+  if (c.stickerMessage) return;
   if (phone && phone === OWNER) return handleOwner(jid, text, c.extendedTextMessage?.contextInfo?.stanzaId);
 
   const kind = c.audioMessage ? "voice note" : c.imageMessage ? "image" : c.videoMessage ? "video" : c.documentMessage ? "document" : null;
@@ -140,97 +147,35 @@ async function handle(m) {
 
   const name = m.pushName || "";
   const s = session(phone || jid);
+  const lang = () => chat.lang || "hinglish";
+
   if (OPT_OUT.test(text)) {
     await api("POST", "/chats/set", { jid: chat.jid, opted_out: true });
-    return say(jid, t(s.lang).optedOut);
+    return say(jid, t(lang()).optedOut);
   }
-  let contact;
-  try { contact = await api("GET", `/contact/${phone || "0"}`); }
-  catch (e) { console.error("contact", e.message); return say(jid, t(s.lang).error); }
 
-  let lang = contact.lang || s.lang;
-  const L = () => t(lang);
-  const setLang = async (l) => { lang = s.lang = l; if (phone) await api("PUT", `/contact/${phone}/lang`, { lang: l }); };
-  const menu = () => (contact.user ? L().menuKnown(contact.user.name) : L().menuUnknown);
-
-  async function escalate(q, withMedia = false) {
+  async function escalate(question, holding, withMedia = false) {
     const now = Date.now();
     s.escalations = s.escalations.filter((x) => now - x < 30 * 60e3);
-    if (s.escalations.length >= 3) return say(jid, L().tooMany); // stops one chat flooding the owner
+    if (s.escalations.length >= 4) return;            // already waiting on the owner; stay quiet
     s.escalations.push(now);
-    const { id } = await api("POST", "/questions", { phone, jid, name, text: q, lang });
-    const sent = await send(OWNER_JID, { text: ownerSummary({ id, name, phone, text: q, lang, contact, kind: withMedia ? kind : null }) });
+    const { id } = await api("POST", "/questions", { phone, jid, name, text: question, lang: lang() });
+    const contact = await api("GET", `/contact/${phone || "0"}`).catch(() => null);
+    const sent = await send(OWNER_JID, { text: ownerSummary({ id, name, phone, text: question, lang: lang(), contact, kind: withMedia ? kind : null }) });
     if (withMedia) await send(OWNER_JID, { forward: m }).catch(() => {});
     await api("PATCH", `/questions/${id}`, { owner_msg_id: sent.key.id });
-    s.lastQ = null;
-    return say(jid, withMedia ? L().media : L().escalated);
+    if (holding) { await say(jid, holding); await api("POST", "/sent", { jid, text: holding }).catch(() => {}); }
   }
 
-  async function answerFreeText(q) {
-    const r = await api("POST", "/match", { text: q, lang });
-    s.lastQ = q;
-    return r.answer ? say(jid, r.answer + L().footer) : escalate(q);
+  if (kind) {
+    await escalate(text || `[${kind}]`, t(lang()).media, true);
+    return;
   }
 
-  // --- language: picked once, remembered
-  if (s.menu === "lang") {
-    const pick = { 1: "en", 2: "hinglish", 3: "hi" }[text];
-    if (!pick) return say(jid, LANG_PROMPT);
-    await setLang(pick);
-    s.menu = "main";
-    await say(jid, L().langSet);
-    const pending = s.pendingText; s.pendingText = null;
-    return pending ? answerFreeText(pending) : say(jid, menu());
-  }
-  if (!lang) {
-    if (HINDI.test(text)) await setLang("hi");
-    else {
-      s.menu = "lang";
-      if (text && !GREETINGS.has(text.toLowerCase())) s.pendingText = text;
-      return say(jid, LANG_PROMPT);
-    }
-  }
-
-  if (kind) return escalate(text || `[${kind}]`, true);
-
-  const lower = text.toLowerCase();
-  if (GREETINGS.has(lower)) { s.menu = "main"; return say(jid, menu()); }
-  if (text === "0") {
-    if (s.lastQ) return escalate(s.lastQ);
-    s.menu = "ask"; return say(jid, L().askOwner);
-  }
-  if (s.menu === "ask") { s.menu = "main"; return escalate(text); }
-
-  if (s.menu === "invoices" && /^\d+$/.test(text) && s.invoices?.[+text - 1]) {
-    s.menu = "main";
-    const r = await api("POST", `/invoices/${s.invoices[+text - 1].id}/pay-link`, { phone });
-    return say(jid, r.paid ? L().alreadyPaid : L().payLink(r.url));
-  }
-
-  if (/^\d$/.test(text)) {
-    s.menu = "main";
-    const known = {
-      1: () => say(jid, contact.sites.length ? L().sites(contact.sites) : L().noSites),
-      2: () => {
-        if (!contact.invoices.length) return say(jid, L().noInvoices);
-        s.invoices = contact.invoices; s.menu = "invoices";
-        return say(jid, L().invoices(contact.invoices));
-      },
-      3: () => say(jid, L().invoicesLink(contact.app_url)),
-      4: () => say(jid, contact.orders.length ? L().orders(contact.orders) : L().noOrders),
-      5: () => { s.menu = "ask"; return say(jid, L().askOwner); },
-      6: () => { s.menu = "lang"; return say(jid, LANG_PROMPT); },
-    };
-    const unknown = {
-      1: () => say(jid, L().join(contact.app_url)),
-      2: () => { s.menu = "ask"; return say(jid, L().askOwner); },
-      3: () => { s.menu = "lang"; return say(jid, LANG_PROMPT); },
-    };
-    const act = (contact.user ? known : unknown)[text];
-    return act ? act() : say(jid, menu());
-  }
-
-  return answerFreeText(text);
+  // The conversation itself.
+  const r = await api("POST", "/reply", { text, phone, jid, name });
+  if (r.reply && !r.escalate) return say(jid, r.reply);
+  return escalate(text, r.reply || t(lang()).checking);
 }
 
 async function start() {
@@ -313,8 +258,10 @@ async function tick() {
   const { chats } = await api("GET", `/chats/due?days=${FOLLOWUP_DAYS}&max=${FOLLOWUP_MAX}`);
   for (const c of chats) {
     const msgs = t(c.lang).followups;
-    await send(c.jid, { text: msgs[Math.min(c.followups, msgs.length - 1)] });
+    const text = msgs[Math.min(c.followups, msgs.length - 1)];
+    await send(c.jid, { text });
     await api("POST", "/chats/followed-up", { jid: c.jid });
+    await api("POST", "/sent", { jid: c.jid, text }).catch(() => {});
     await sleep(20e3 + Math.random() * 40e3); // spread out — a burst of identical texts looks like spam
   }
 }
