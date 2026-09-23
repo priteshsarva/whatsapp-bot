@@ -167,7 +167,8 @@ async function handle(m) {
 }
 
 // ---- wait for them to finish -------------------------------------------------
-const WAIT_MS = Number(process.env.REPLY_WAIT_MS || 8000);        // quiet time before replying
+const WAIT_MS = Number(process.env.REPLY_WAIT_MS || 3500);          // quiet time before replying
+const TYPING_STOP_MS = Number(process.env.REPLY_TYPING_STOP_MS || 1200); // they stopped typing -> go
 const MAX_WAIT_MS = Number(process.env.REPLY_MAX_WAIT_MS || 60000); // ...but never hold longer than this
 const pending = new Map();   // jid -> { first, timer, parts[], ctx }
 
@@ -179,13 +180,14 @@ function queue(ctx) {
   hold(ctx.jid);
 }
 
-// (re)start the quiet timer — called again on every new message and while they type
-function hold(jid) {
+// (re)start the timer. wait=WAIT_MS while we're unsure, or TYPING_STOP_MS the moment
+// WhatsApp tells us they've stopped typing — no point sitting there waiting then.
+function hold(jid, wait = WAIT_MS) {
   const p = pending.get(jid);
   if (!p) return;
   clearTimeout(p.timer);
   const left = p.first + MAX_WAIT_MS - Date.now();
-  p.timer = setTimeout(() => flush(jid), Math.max(1000, Math.min(WAIT_MS, left)));
+  p.timer = setTimeout(() => flush(jid), Math.max(600, Math.min(wait, left)));
 }
 
 async function flush(jid) {
@@ -263,10 +265,12 @@ async function start() {
     // Log and stay silent: flush() owns the reply path and its own fallback.
     for (const m of messages) handle(m).catch((e) => console.error("handle", e));
   });
-  // They're still typing (or recording) — keep waiting instead of answering half a thought.
+  // Typing -> keep waiting (they have more to say). Stopped typing -> answer almost at once.
   sock.ev.on("presence.update", ({ id, presences }) => {
     if (!pending.has(id)) return;
-    if (Object.values(presences || {}).some((p) => p?.lastKnownPresence === "composing" || p?.lastKnownPresence === "recording")) hold(id);
+    const states = Object.values(presences || {}).map((p) => p?.lastKnownPresence);
+    if (states.some((s) => s === "composing" || s === "recording")) hold(id, WAIT_MS);
+    else if (states.length) hold(id, TYPING_STOP_MS);
   });
   if (freshLink) sock.ev.on("messaging-history.set", ({ chats, messages }) => markLegacy(chats, messages).catch((e) => console.error("legacy", e.message)));
 }
