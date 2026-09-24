@@ -64,6 +64,7 @@ async function say(jid, text) {
 const msOf = (ts) => 1000 * (ts && typeof ts === "object" ? (ts.toNumber ? ts.toNumber() : Number(ts.low)) : Number(ts || 0));
 const istHour = () => Number(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata", hour: "numeric", hour12: false })) % 24;
 const istDate = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+const istMidnightMs = () => new Date(`${istDate()}T00:00:00+05:30`).getTime();   // start of today, IST
 
 // Phone digits of the sender. Newer WhatsApp chats can arrive as a privacy "@lid" id.
 async function phoneOf(key) {
@@ -144,9 +145,10 @@ const OPT_OUT = /^(stop|unsubscribe|band karo|mat bhejo|message mat karo|बं�
 async function handle(m) {
   const jid = m.key.remoteJid;
   if (!jid || /@(g\.us|broadcast|newsletter)$/.test(jid)) return;
-  // Only live traffic: nothing from before GO_LIVE, nothing replayed from >12h ago after downtime.
+  // Answer anything from today (IST): on a restart, WhatsApp replays the day's backlog
+  // as "append" and we still reply to it. Nothing before GO_LIVE, nothing before today.
   const at = msOf(m.messageTimestamp);
-  if (at < GO_LIVE_MS || at < Date.now() - 12 * 3600e3) return;
+  if (at < GO_LIVE_MS || at < istMidnightMs()) return;
   const c = normalizeMessageContent(m.message);
   if (!c || c.reactionMessage || c.protocolMessage) return;
 
@@ -167,6 +169,9 @@ async function handle(m) {
   // Is this chat the bot's? Legacy (pre-GO_LIVE) and muted chats are left to you.
   const { chat } = await api("POST", "/chats/event", { jid, phone, dir: "in" });
   if (chat.status !== "active") return;
+  // Don't re-answer something we already replied to — WhatsApp can re-deliver the day's
+  // backlog on reconnect. Skip any message older than our last outgoing one in this chat.
+  if (chat.last_out_at && at <= new Date(chat.last_out_at).getTime()) return;
   if ((pausedUntil.get(jid) || 0) > Date.now()) return;
 
   const name = m.pushName || "";
@@ -220,7 +225,10 @@ async function flush(jid) {
     s.escalations = s.escalations.filter((x) => now - x < 30 * 60e3);
     if (s.escalations.length >= 4) return;            // already waiting on the owner; stay quiet
     s.escalations.push(now);
-    const { id } = await api("POST", "/questions", { phone, jid, name, text: question, lang });
+    const { id, duplicate } = await api("POST", "/questions", { phone, jid, name, text: question, lang });
+    // Same question is already waiting on the owner — don't ping them a second time.
+    // Just hold the client; the owner answers the one pending copy and it goes out.
+    if (duplicate) { if (holding) { await say(jid, holding); await api("POST", "/sent", { jid, text: holding }).catch(() => {}); } return; }
     const contact = await api("GET", `/contact/${phone || "0"}`).catch(() => null);
     const sent = await send(OWNER_JID, { text: ownerSummary({ id, name, phone, text: question, lang, contact, kind: withMedia ? kind : null }) });
     if (withMedia && msg) await send(OWNER_JID, { forward: msg }).catch(() => {});
