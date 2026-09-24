@@ -1,13 +1,12 @@
 // The few fixed lines the bot sends without asking the model: follow-up nudges,
-// opt-out, "let me check", and errors. Everything else is written by the assistant
+// opt-out, a media acknowledgement, and errors. Deliberately NO "let me check with the team" line.
 // in the client's own language. Edit the wording here.
 const d = (x) => (x ? new Date(x).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "-");
 const rs = (n) => "₹" + Number(n || 0).toLocaleString("en-IN");
 
 const T = {
   en: {
-    checking: "Let me check this with the team and get back to you shortly.",
-    media: "Got it, thanks — let me look at this and come back to you.",
+    media: "Got it 👍",
     optedOut: "Okay, no more reminders from us. You can still message anytime.",
     error: "Sorry, something went wrong on our side. Please send that again in a minute.",
     followups: [
@@ -16,8 +15,7 @@ const T = {
     ],
   },
   hinglish: {
-    checking: "Main team se confirm karke abhi batata hoon.",
-    media: "Mil gaya, thanks — dekh kar batata hoon.",
+    media: "Mil gaya ji 👍",
     optedOut: "Theek hai, ab reminder nahi bhejenge. Aap kabhi bhi message kar sakte hain.",
     error: "Sorry, hamari taraf se kuch gadbad ho gayi. Ek minute baad dobara bhejiye.",
     followups: [
@@ -26,8 +24,7 @@ const T = {
     ],
   },
   hi: {
-    checking: "मैं टीम से पूछकर अभी बताता हूँ।",
-    media: "मिल गया, धन्यवाद — देखकर बताता हूँ।",
+    media: "मिल गया जी 👍",
     optedOut: "ठीक है, अब रिमाइंडर नहीं भेजेंगे। आप कभी भी मैसेज कर सकते हैं।",
     error: "क्षमा करें, हमारी तरफ़ से कुछ गड़बड़ हुई। एक मिनट बाद दोबारा भेजिए।",
     followups: [

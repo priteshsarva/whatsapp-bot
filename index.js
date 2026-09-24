@@ -266,6 +266,7 @@ async function flush(jid) {
     if (kind) return await escalate(text || `[${kind}]`, t(lang).media, true);
     if (!text) return;
     const r = await api("POST", "/reply", { text, phone, jid, name });
+    markInterest(jid, r.score);
     if (r.reply && !r.escalate) {
       await say(jid, r.reply);
       // Product photos from our catalogue — captions carry details, never prices.
@@ -275,11 +276,13 @@ async function flush(jid) {
       }
       return;
     }
-    await escalate(text, r.reply || t(lang).checking);
+    // No "let me check with the team" — the chat simply pauses while the owner answers.
+    // If they haven't in REENGAGE_MIN, reengageTick() picks the talk back up.
+    await escalate(text, null);
   } catch (e) {
-    // Never show the client an error. Hand it to the owner quietly and say we're checking.
+    // Never show the client an error. Hand it to the owner quietly.
     console.error("flush", e);
-    await escalate(text || "[failed to process]", t(lang).checking).catch(() => {});
+    await escalate(text || "[failed to process]", null).catch(() => {});
   }
 }
 
@@ -348,12 +351,99 @@ async function markLegacy(chats = [], messages = []) {
   }
 }
 
-// Every 30 min, 10:00–19:00 IST: nudge chats that went quiet after our last message,
-// and once a day remind the owner of questions they haven't answered.
-let lastReminder = "";
-async function tick() {
+// ---- "interested" labels on the bot phone -------------------------------------
+// Hot and warm leads get a WhatsApp label, so you can filter them on the phone.
+// Labels only exist on WhatsApp BUSINESS accounts; on a normal account the first call
+// fails and labelling switches itself off — the portal's Leads tab still has them all.
+const LABELS = {
+  hot:  { id: "kartify_hot",  name: "🔥 Hot lead",   color: 1 },
+  warm: { id: "kartify_warm", name: "🙂 Interested", color: 4 },
+};
+let labelsOn = null;           // null = not tried yet, true/false after the first attempt
+const labelled = new Map();    // jid -> score already applied
+async function ensureLabels() {
+  if (labelsOn !== null) return labelsOn;
+  try {
+    for (const l of Object.values(LABELS)) await sock.addLabel(OWNER_JID, { id: l.id, name: l.name, color: l.color });
+    labelsOn = true;
+  } catch (e) {
+    labelsOn = false;
+    console.log("labels off (needs WhatsApp Business on the bot number):", e.message);
+  }
+  return labelsOn;
+}
+async function markInterest(jid, score) {
+  if (!LABELS[score] || labelled.get(jid) === score) return;
+  if (!(await ensureLabels())) return;
+  try {
+    const old = labelled.get(jid);
+    if (old && LABELS[old]) await sock.removeChatLabel(jid, LABELS[old].id).catch(() => {});
+    await sock.addChatLabel(jid, LABELS[score].id);
+    labelled.set(jid, score);
+  } catch (e) { console.error("label", e.message); }
+}
+
+// ---- the clock ---------------------------------------------------------------
+// Every 5 min:
+//   · pick up chats left hanging on the owner for REENGAGE_MIN (8am–11pm IST — someone
+//     who just messaged is awake, and silence is what loses them)
+//   · once a day after REPORT_HOUR, send the owner the day's report
+// Every 30 min, 10:00–19:00 IST: follow-ups and the morning reminders, as before.
+const REENGAGE_MIN = Number(process.env.REENGAGE_MIN || 15);
+const REPORT_HOUR = Number(process.env.REPORT_HOUR || 20);
+let lastReminder = "", lastReport = "", lastSlowTick = 0;
+
+async function reengageTick() {
   const h = istHour();
-  if (!sock?.user || h < ACTIVE_HOURS[0] || h >= ACTIVE_HOURS[1]) return;
+  if (h < 8 || h >= 23) return;
+  const { chats } = await api("GET", `/chats/reengage?mins=${REENGAGE_MIN}`);
+  for (const c of chats) {
+    await say(c.jid, c.text);   // say() records the outgoing message, so this chat won't be picked again
+    await sleep(3000 + Math.random() * 4000);
+  }
+}
+
+async function reportTick() {
+  if (istHour() < REPORT_HOUR || lastReport === istDate()) return;
+  lastReport = istDate();
+  const r = await api("GET", "/report/today");
+  const n = (x) => x ?? 0;
+  const byScore = Object.fromEntries((r.leads || []).map((l) => [l.score, l.n]));
+  const lines = [
+    `📊 *Today's WhatsApp report* — ${istDate()}`,
+    "",
+    `💬 ${n(r.msgs?.chats)} chats · ${n(r.msgs?.incoming)} messages in · ${n(r.msgs?.sent)} replies out`,
+    `🆕 ${n(r.chats?.new_chats)} new chats (${n(r.chats?.you_started)} started by you)`,
+    `🤖 ${n(r.qs?.answered_by_ai)} answered by the assistant · 👤 ${n(r.qs?.answered_by_you)} by you · ⏳ ${n(r.qs?.waiting_on_you)} waiting on you`,
+    `🎯 Leads: 🔥 ${n(byScore.hot)} hot · 🙂 ${n(byScore.warm)} warm · ${n(byScore.cold)} cold`,
+  ];
+  if (r.hot?.length) {
+    lines.push("", "*Interested today:*");
+    for (const l of r.hot) {
+      const facts = [l.business, l.city, l.sells].filter(Boolean).join(" · ");
+      lines.push(`${l.score === "hot" ? "🔥" : "🙂"} ${l.name || "+" + l.phone}${facts ? " — " + facts : ""}\n   wa.me/${l.phone} · ${l.score_reason || ""}`);
+    }
+  }
+  if (r.pending?.length) {
+    lines.push("", "*Still waiting on you:*");
+    for (const q of r.pending) lines.push(`#${q.id} · ${q.name || "+" + q.phone}: "${String(q.text).slice(0, 70)}"`);
+    lines.push("Reply  #id <answer>  or  #id skip");
+  }
+  await send(OWNER_JID, { text: lines.join("\n") });
+}
+
+async function tick() {
+  if (!sock?.user) return;
+  await reengageTick().catch((e) => console.error("reengage", e.message));
+  await reportTick().catch((e) => console.error("report", e.message));
+  if (Date.now() - lastSlowTick < 30 * 60e3) return;
+  lastSlowTick = Date.now();
+  await slowTick();
+}
+
+async function slowTick() {
+  const h = istHour();
+  if (h < ACTIVE_HOURS[0] || h >= ACTIVE_HOURS[1]) return;
 
   if (lastReminder !== istDate()) {
     lastReminder = istDate();
@@ -383,6 +473,6 @@ async function tick() {
     await sleep(20e3 + Math.random() * 40e3); // spread out — a burst of identical texts looks like spam
   }
 }
-setInterval(() => tick().catch((e) => console.error("tick", e.message)), 30 * 60e3);
+setInterval(() => tick().catch((e) => console.error("tick", e.message)), 5 * 60e3);
 
 start();
