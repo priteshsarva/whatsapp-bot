@@ -8,6 +8,12 @@ import QRCode from "qrcode";
 import fs from "fs";
 import { t, ownerSummary, OWNER_HELP } from "./texts.js";
 
+// Baileys' encryption layer console.logs a whole "Closing session: SessionEntry {…}"
+// dump every time it re-keys with a contact. It is normal, it is not an error, and it
+// buries the lines that matter in pm2 logs.
+const _log = console.log;
+console.log = (...a) => { if (typeof a[0] === "string" && /^Closing (session|open session|stale)/.test(a[0])) return; _log(...a); };
+
 const { BACKEND_URL, WA_INTERNAL_KEY, OWNER_PHONE, AUTH_DIR = "./auth", GO_LIVE } = process.env;
 if (!BACKEND_URL || !WA_INTERNAL_KEY || !OWNER_PHONE || !GO_LIVE) throw new Error("Set BACKEND_URL, WA_INTERNAL_KEY, OWNER_PHONE, GO_LIVE in .env");
 const OWNER = OWNER_PHONE.replace(/\D/g, "");
