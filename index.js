@@ -94,6 +94,11 @@ async function handleOwner(jid, text, quoted) {
     const r = await api("POST", "/chats/set", { phone: onOff[2], status }).catch((e) => ({ error: e.message }));
     return send(jid, { text: r.error ? `⚠️ ${r.error}` : r.updated ? `✅ Bot ${onOff[1].toLowerCase()} for ${onOff[2].trim()}` : `No chat found for ${onOff[2].trim()}` });
   }
+  if (/^(ping|status)$/i.test(text.trim())) {
+    const up = Math.round(process.uptime() / 60);
+    const ok = await api("GET", "/questions/stale?hours=999999").then(() => "reachable").catch((e) => `UNREACHABLE (${e.message})`);
+    return send(jid, { text: `✅ Bot alive · connected · up ${up} min\nBackend: ${ok}` });
+  }
   const reset = text.match(/^reset\s+([\d\s+]{10,})$/i);
   if (reset) {
     const r = await api("POST", "/forget", { phone: reset[1] }).catch((e) => ({ error: e.message }));
@@ -141,6 +146,7 @@ async function handleManualOut(jid, text) {
 }
 
 const OPT_OUT = /^(stop|unsubscribe|band karo|mat bhejo|message mat karo|बंद करो|मत भेजो)$/i;
+const handled = new Set();   // message ids already processed (WhatsApp re-delivers on reconnect)
 
 async function handle(m) {
   const jid = m.key.remoteJid;
@@ -169,9 +175,14 @@ async function handle(m) {
   // Is this chat the bot's? Legacy (pre-GO_LIVE) and muted chats are left to you.
   const { chat } = await api("POST", "/chats/event", { jid, phone, dir: "in" });
   if (chat.status !== "active") return;
-  // Don't re-answer something we already replied to — WhatsApp can re-deliver the day's
-  // backlog on reconnect. Skip any message older than our last outgoing one in this chat.
-  if (chat.last_out_at && at <= new Date(chat.last_out_at).getTime()) return;
+  // Don't re-answer something we already replied to. WhatsApp re-delivers on reconnect,
+  // so ids are remembered; the timestamp check only drops CLEARLY stale backlog (5+ min
+  // older than our last reply) — a tight comparison silences the chat whenever the
+  // sender's phone clock runs behind the server's.
+  if (handled.has(m.key.id)) return;
+  handled.add(m.key.id);
+  if (handled.size > 3000) handled.delete(handled.values().next().value);
+  if (chat.last_out_at && at < new Date(chat.last_out_at).getTime() - 5 * 60e3) return;
   if ((pausedUntil.get(jid) || 0) > Date.now()) return;
 
   const name = m.pushName || "";
@@ -223,7 +234,16 @@ async function flush(jid) {
   const escalate = async (question, holding, withMedia = false) => {
     const now = Date.now();
     s.escalations = s.escalations.filter((x) => now - x < 30 * 60e3);
-    if (s.escalations.length >= 4) return;            // already waiting on the owner; stay quiet
+    // Too many already waiting on the owner: stop pinging them, but NEVER leave the
+    // client on read — during a long AI outage that turns into total silence.
+    if (s.escalations.length >= 6) {
+      if (holding && now - (s.lastHold || 0) > 10 * 60e3) {
+        s.lastHold = now;
+        await say(jid, holding);
+        await api("POST", "/sent", { jid, text: holding }).catch(() => {});
+      }
+      return;
+    }
     s.escalations.push(now);
     const { id, duplicate } = await api("POST", "/questions", { phone, jid, name, text: question, lang });
     // Same question is already waiting on the owner — don't ping them a second time.
