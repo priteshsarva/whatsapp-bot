@@ -489,6 +489,27 @@ let lastSlowTick = 0;
 const sentToday = (name) => { try { return fs.readFileSync(`${AUTH_DIR}/${name}`, "utf8") === istDate(); } catch { return false; } };
 const markSentToday = (name) => { try { fs.writeFileSync(`${AUTH_DIR}/${name}`, istDate()); } catch (e) { console.error(name, e.message); } };
 
+// Messages you sent from the portal's Leads screen. The backend queues them (it can't reach
+// WhatsApp itself) and this delivers them from the bot number, so the reply comes back into
+// the same chat and the assistant carries on from there.
+async function outboxTick() {
+  if (!sock?.user || !openNow()) return;   // queued at 2am -> goes out at 6am
+  const { messages } = await api("GET", "/outbox");
+  for (const m of messages || []) {
+    try {
+      await say(m.jid, m.text);
+      await api("POST", "/sent", { jid: m.jid, text: m.text }).catch(() => {});
+      await api("POST", `/outbox/${m.id}/done`, { ok: true });
+      console.log(`[wa-outbox] sent to ${m.phone || m.jid}`);
+    } catch (e) {
+      console.error("[wa-outbox]", e.message);
+      await api("POST", `/outbox/${m.id}/done`, { ok: false, error: e.message }).catch(() => {});
+    }
+    await sleep(2000 + Math.random() * 2000);
+  }
+}
+setInterval(() => outboxTick().catch((e) => console.error("outbox", e.message)), 20e3);
+
 // Messages that came in overnight: answer them when the day opens, oldest first.
 function flushHeld() {
   if (!openNow()) return;
