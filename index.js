@@ -234,8 +234,12 @@ async function handle(m) {
   if (!text && !kind) return;
 
   // Is this chat the bot's? Legacy (pre-GO_LIVE) and muted chats are left to you.
-  const { chat } = await api("POST", "/chats/event", { jid, phone, dir: "in" });
-  if (chat.status !== "active") return;
+  // The text goes with it so the backend can spot a WhatsApp Business auto-greeting
+  // ("THANK YOU FOR CONTACTING…", "*Welcome to …* Place Your Order On Website") — two of
+  // three reference chats answered our opener with one of those inside five seconds.
+  // Answering it would be the bot talking to a robot, so we wait for the actual person.
+  const { chat, auto } = await api("POST", "/chats/event", { jid, phone, dir: "in", text });
+  if (chat.status !== "active" || auto) return;
   // Don't re-answer something we already replied to (ids are deduped at the top). The
   // timestamp check only drops CLEARLY stale backlog (5+ min older than our last reply) —
   // a tight comparison silences the chat whenever the sender's phone clock runs behind the server's.
@@ -489,6 +493,57 @@ let lastSlowTick = 0;
 const sentToday = (name) => { try { return fs.readFileSync(`${AUTH_DIR}/${name}`, "utf8") === istDate(); } catch { return false; } };
 const markSentToday = (name) => { try { fs.writeFileSync(`${AUTH_DIR}/${name}`, istDate()); } catch (e) { console.error(name, e.message); } };
 
+// ---- outreach campaign --------------------------------------------------------
+// A few numbers per tick, two opening messages each, working hours only. Deliberately slow:
+// a burst of identical messages from one number is what gets a WhatsApp number banned.
+// After this the normal assistant handles whatever they reply.
+async function campaignTick() {
+  // The outreach window (default 8am-7pm IST) lives in the portal, not here — the backend
+  // returns no contacts outside it, so changing the hours needs no bot restart. The quiet
+  // hours below are still a hard floor.
+  if (!sock?.user || !openNow()) return;
+
+  // stop chasing silence, and hand anyone promising to the owner
+  const { qualified } = await api("POST", "/campaign/tick").catch(() => ({ qualified: [] }));
+  for (const q of qualified || []) {
+    const about = [q.business || q.store_name, q.city, q.sells].filter(Boolean).join(" · ");
+    // Lead with WHY. "wants a reference" or "asked to move their existing site" tells you
+    // what to open with; "hot" tells you nothing, which is why it no longer decides this.
+    const why = { call: "wants to talk on the phone", reference: "wants proof we're real — customers, who's behind it",
+      migrate: "has a site already, asked if we can move/rebuild it", supplier: "gave you their own supplier",
+      sourcing: "wants to buy stock, not a store", numbers: "told you real order numbers", paying: "ready to pay" };
+    const signals = (q.signals || []).map((s) => why[s]).filter(Boolean);
+    await send(OWNER_JID, { text:
+      `🔥 *Qualified lead — take over*\n${q.name || "+" + q.phone}${about ? `\n${about}` : ""}` +
+      `\nwa.me/${q.phone}` +
+      (q.demo_slug ? `\nDemo: https://${q.demo_slug}.thekartify.com` : "") +
+      (signals.length ? `\n\n*Why:*\n• ${signals.join("\n• ")}` : "") +
+      `\n${q.score_reason || ""}` +
+      `\n\nBot is still handling it. Send *off ${String(q.phone).slice(-10)}* to take the chat over yourself.` });
+    await sleep(1500);
+  }
+
+  const { contacts, openers } = await api("GET", "/campaign/next");
+  for (const c of contacts || []) {
+    const jid = `${c.phone}@s.whatsapp.net`;
+    try {
+      // Make it the bot's chat first, so their reply is handled instead of ignored.
+      await api("POST", "/chats/event", { jid, phone: c.phone, dir: "out" }).catch(() => {});
+      for (const [i, text] of (openers || []).entries()) {
+        await say(jid, text);                                  // sent as separate messages
+        await api("POST", "/sent", { jid, text }).catch(() => {});
+        if (i === 0) await sleep(4000 + Math.random() * 4000);  // a human pause between the two
+      }
+      await api("POST", `/campaign/${c.id}/sent`, { ok: true });
+      console.log(`[wa-campaign] opened ${c.phone}`);
+    } catch (e) {
+      console.error("[wa-campaign]", c.phone, e.message);
+      await api("POST", `/campaign/${c.id}/sent`, { ok: false, error: e.message }).catch(() => {});
+    }
+    await sleep(45e3 + Math.random() * 45e3);   // 45-90s between people
+  }
+}
+
 // Messages you sent from the portal's Leads screen. The backend queues them (it can't reach
 // WhatsApp itself) and this delivers them from the bot number, so the reply comes back into
 // the same chat and the assistant carries on from there.
@@ -598,6 +653,7 @@ async function reportTick() {
 async function tick() {
   if (!sock?.user) return;
   flushHeld();   // anything that came in during the quiet hours
+  campaignTick().catch((e) => console.error("campaign", e.message));
   // Demo stores past their 7 days switch themselves off (nothing is deleted).
   api("POST", "/demo/sweep").catch((e) => console.error("demo sweep", e.message));
   await reengageTick().catch((e) => console.error("reengage", e.message));
